@@ -1,0 +1,14 @@
+{
+  "name": "Local Font Bridge",
+  "id": "local-font-bridge-dev",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "devAllowedDomains": ["ws://localhost:3055"],
+    "reasoning": "開発中のみ、同一Mac上のローカルブローカー(127.0.0.1:3055)と WebSocket で通信します。外部通信はしません。"
+  }
+}

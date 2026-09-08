@@ -1,0 +1,106 @@
+<!-- Local Font Bridge — ui.html
+     役割: ローカルブローカー(ws://localhost:3055) と WebSocket でつながり、
+           届いた RPC を code.js に渡し、結果を返す「配線係」。
+     フォントを触るのは code.js 側。ここは通信と状態表示だけ。 -->
+<style>
+  body { font: 12px -apple-system, "Hiragino Sans", sans-serif; margin: 0; padding: 12px; color: #222; }
+  h1 { font-size: 13px; margin: 0 0 10px; }
+  label { display: block; margin: 8px 0 4px; font-weight: 600; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+  .row { display: flex; gap: 6px; margin-top: 10px; }
+  button { flex: 1; padding: 7px; border: 1px solid #ccc; border-radius: 4px; background: #fff; font: inherit; cursor: pointer; }
+  button.primary { background: #0d99ff; border-color: #0d99ff; color: #fff; }
+  .state { margin-top: 12px; padding: 8px; border-radius: 4px; background: #f2f2f2; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #bbb; vertical-align: 1px; }
+  .dot.on { background: #14ae5c; }
+  .dot.err { background: #f24822; }
+  #log { margin-top: 8px; height: 92px; overflow: auto; font: 10px ui-monospace, Menlo, monospace; color: #666;
+         background: #fafafa; border: 1px solid #eee; border-radius: 4px; padding: 6px; white-space: pre-wrap; }
+</style>
+
+<h1>Local Font Bridge</h1>
+
+<label for="token">ブローカーのトークン（起動時に表示されたもの）</label>
+<input id="token" type="text" placeholder="例: 3f9a...（broker/.token の中身）" autocomplete="off" />
+
+<div class="row">
+  <button id="connect" class="primary">接続</button>
+  <button id="disconnect">切断</button>
+</div>
+
+<div class="state"><span id="dot" class="dot"></span><span id="status">未接続</span></div>
+<div id="log"></div>
+
+<script>
+  // ブローカーの WebSocket アドレス（manifest の devAllowedDomains と一致させる）
+  const WS_URL = "ws://localhost:3055";
+
+  const $ = (id) => document.getElementById(id);
+  let socket = null;
+  let retryTimer = null;
+
+  function log(msg) {
+    const el = $("log");
+    el.textContent += new Date().toLocaleTimeString() + " " + msg + "\n";
+    el.scrollTop = el.scrollHeight;
+  }
+  function setState(text, kind) {
+    $("status").textContent = text;
+    $("dot").className = "dot" + (kind ? " " + kind : "");
+  }
+
+  function connect() {
+    const token = $("token").value.trim();
+    if (!token) { setState("トークンを貼ってください", "err"); return; }
+    // トークンはこのUIの間だけ保持（clientStorage には書かない = 漏えい面積を増やさない）
+    disconnect(true);
+    setState("接続中…");
+    try { socket = new WebSocket(WS_URL); }
+    catch (e) { setState("接続失敗: " + e, "err"); return; }
+
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ type: "auth", token: token, info: { plugin: "local-font-bridge" } }));
+      log("WebSocket オープン → 認証送信");
+    };
+
+    socket.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "auth_ok") { setState("接続済み（待機中）", "on"); log("認証OK"); return; }
+      if (msg.type === "auth_failed") { setState("トークンが違います", "err"); log("認証NG"); return; }
+      if (msg.type === "rpc") {
+        log("← " + msg.method);
+        // フォントを触れるのは code.js 側だけなので、そのまま転送する
+        parent.postMessage({ pluginMessage: { type: "rpc", id: msg.id, method: msg.method, params: msg.params } }, "*");
+      }
+    };
+
+    socket.onclose = () => {
+      if (socket) { setState("切断されました", "err"); log("WebSocket クローズ"); }
+      socket = null;
+    };
+    socket.onerror = () => { setState("通信エラー（ブローカーは起動していますか）", "err"); };
+  }
+
+  function disconnect(silent) {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (socket) { const s = socket; socket = null; try { s.close(); } catch (e) {} }
+    if (!silent) { setState("未接続"); log("切断しました"); }
+  }
+
+  // code.js からの結果をブローカーへ返す
+  window.onmessage = (event) => {
+    const msg = event.data && event.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === "rpc_result") {
+      log("→ 結果 " + (msg.result && msg.result.ok ? "ok" : "error"));
+      if (socket && socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: "rpc_result", id: msg.id, result: msg.result }));
+      }
+    }
+  };
+
+  $("connect").onclick = connect;
+  $("disconnect").onclick = () => disconnect(false);
+  $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+</script>
