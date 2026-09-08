@@ -1,138 +1,143 @@
-# figma-font-bridge — ローカルフォントブリッジ
+# figma-font-bridge — Local Font Bridge for Figma
 
-Figma MCP（`use_figma`）はリモート実行のため、このMacにインストールされたローカルフォント
-（Mizolet / New Rubrik Edge / A1 Mincho など）が見えない。
-一方、**Figmaデスクトップの開発者プラグインの中ではローカルフォントが完全に見える**
-（`tools/figma-font-probe/` で実測: 11,095件・`loadFontAsync` 成功）。
+> 日本語版: [README.ja.md](README.ja.md)
 
-このツールは、その差を埋める「橋」。Claude（このMac上のシェル）から HTTP を叩くと、
-ローカルブローカー経由で Figma プラグインにテキスト操作を依頼できる。
+Figma's MCP tools (`use_figma`) execute remotely — in the cloud — so they cannot see
+fonts installed on your machine (Adobe Fonts, purchased fonts, even OS-bundled ones).
+Meanwhile, **a Figma desktop development plugin has full access to local fonts**
+(measured: 11,095 font records visible, all loadable via `loadFontAsync`, vs. ~8,900
+Google-Fonts-centric records from the cloud side).
+
+This tool bridges that gap. An AI agent (or any script) on the same Mac calls a local
+HTTP endpoint, and the request is relayed to a Figma plugin that performs the text
+operation with real local fonts.
 
 ```
-Claude(Bash/curl) --HTTP 127.0.0.1:3056--> ブローカー --WS 127.0.0.1:3055--> プラグインUI --postMessage--> code.js(Plugin API・フォント可)
+Agent (curl) --HTTP 127.0.0.1:3056--> broker --WS 127.0.0.1:3055--> plugin UI --postMessage--> code.js (Plugin API, local fonts OK)
 ```
 
-## 構成
+## Layout
 
-| パス | 役割 |
+| Path | Role |
 |---|---|
-| `broker/server.js` | ブローカー本体（Node.js・依存パッケージなし） |
-| `broker/ws-min.js` | 最小 WebSocket サーバ実装（`ws` パッケージを入れずに済ませるため） |
-| `broker/mock-plugin.js` | Figma を起動せず配線だけ検証するモック |
-| `broker/.token` | 起動ごとに発行されるトークン（gitignore・600） |
-| `broker/bridge.log` | 通信ログ |
-| `plugin/manifest.json` `plugin/code.js` `plugin/ui.html` | Figma 開発者プラグイン |
+| `broker/server.js` | The broker (Node.js, zero dependencies) |
+| `broker/ws-min.js` | Minimal WebSocket server implementation (avoids the `ws` package) |
+| `broker/mock-plugin.js` | Mock plugin to test the wiring without launching Figma |
+| `broker/.token` | Per-launch auth token (gitignored, mode 600) |
+| `broker/bridge.log` | Communication log |
+| `plugin/manifest.json` `plugin/code.js` `plugin/ui.html` | The Figma development plugin |
 
 ---
 
-## 初回セットアップ（ユーザー操作）
+## Setup (manual steps)
 
-### ① ブローカーを起動（このMacのターミナル）
+### 1. Start the broker (terminal on this Mac)
 
 ```bash
-cd /path/to/figma-font-bridge  # このリポジトリを置いた場所
+cd /path/to/figma-font-bridge  # wherever you cloned this repo
 node broker/server.js
 ```
 
-起動すると **トークン（32桁）** が画面に表示される（`broker/.token` にも保存される）。
-このターミナルは開いたままにする。
+On launch it prints a **32-char token** (also written to `broker/.token`).
+Keep this terminal open.
 
-### ② Figma にプラグインを取り込む（初回だけ）
+### 2. Import the plugin into Figma (first time only)
 
-Figmaデスクトップアプリ（日本語UI）で:
+In the Figma desktop app:
 
-1. メニュー（左上のFigmaロゴ）→ **プラグイン** → **開発** → **マニフェストからプラグインをインポート…**
-2. `tools/figma-font-bridge/plugin/manifest.json` を選ぶ
-3. これで「Local Font Bridge」が開発版プラグイン一覧に入る
+1. Menu (Figma logo, top left) → **Plugins** → **Development** → **Import plugin from manifest…**
+2. Select `plugin/manifest.json` from this repo
+3. "Local Font Bridge" now appears under your development plugins
 
-### ③ 対象ファイルを開いてプラグインを起動
+### 3. Open the target file and run the plugin
 
-作業したい Figma ファイルを開いた状態で
-メニュー → **プラグイン** → **開発** → **Local Font Bridge**
+With the Figma file you want to work on open:
+Menu → **Plugins** → **Development** → **Local Font Bridge**
 
-### ④ トークンを貼って「接続」
+### 4. Paste the token and connect
 
-プラグインUIの入力欄に①のトークンを貼り、**接続** を押す。
-緑のドット＋「接続済み（待機中）」になれば準備完了。
+Paste the token from step 1 into the plugin UI and press **Connect**.
+A green dot with "connected (idle)" means it's ready.
 
-> プラグインパネルを閉じるとブリッジも切れる。作業中は開いたままにする。
+> Closing the plugin panel kills the bridge. Keep it open while working.
 
 ---
 
-## Claude 側からの呼び出し（curl）
+## Calling the bridge (curl)
 
 ```bash
-cd /path/to/figma-font-bridge  # このリポジトリを置いた場所
+cd /path/to/figma-font-bridge  # wherever you cloned this repo
 T=$(cat broker/.token)
 
-# 接続確認
+# Connection check
 curl -s -H "X-Bridge-Token: $T" http://127.0.0.1:3056/status
 
-# フォント環境の診断
+# Probe the font environment
 curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   -d '{"method":"fonts.probe"}' http://127.0.0.1:3056/rpc
 
-# Figmaで選択中のノードの nodeId を知る
+# Get the nodeId of the current selection in Figma
 curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   -d '{"method":"selection.get"}' http://127.0.0.1:3056/rpc
 
-# 幅768で折り返しを確定（高さは自動）
+# Reflow text at width 768 (height auto)
 curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   -d '{"method":"text.reflow","params":{"nodeId":"123:456","width":768,"autoResize":"HEIGHT"}}' \
   http://127.0.0.1:3056/rpc
 
-# 仮置きフォント → 本物のフォントへ差し替え
+# Swap a placeholder font for the real one
 curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   -d '{"method":"text.setFont","params":{"nodeId":"123:456","family":"Mizolet","style":"Regular"}}' \
   http://127.0.0.1:3056/rpc
 ```
 
-### メソッド一覧
+### Methods
 
-| method | params | 返り値 |
+| method | params | returns |
 |---|---|---|
-| `fonts.probe` | `match?`（正規表現文字列） | 利用可能フォント数・一致したファミリ一覧・ファイル名 |
-| `selection.get` | — | 選択中ノードの id / type / 位置サイズ |
-| `node.get` | `nodeId` | 型・位置サイズ、TEXTなら characters / fontName(s) / fontSize / lineHeight / textAutoResize |
-| `text.reflow` | `nodeId`, `width?`, `autoResize`（`HEIGHT`\|`NONE`\|`WIDTH_AND_HEIGHT`\|`TRUNCATE`） | before / after の bounds |
-| `text.setStyle` | `nodeId`, `fontSize?`, `lineHeight?{value,unit}`, `letterSpacing?` | before / after の bounds と適用値 |
-| `text.setFont` | `nodeId`, `family`, `style` | before / after、混在スタイルだった場合の警告 |
-| `text.setCharacters` | `nodeId`, `characters` | before / after、混在スタイルの警告 |
-| `node.export` | `nodeId`, `scale?`(既定1) | PNG の Base64（4096px/辺・8MB上限） |
+| `fonts.probe` | `match?` (regex string) | available font count, matching families, file names |
+| `selection.get` | — | id / type / bounds of selected nodes |
+| `node.get` | `nodeId` | type and bounds; for TEXT also characters / fontName(s) / fontSize / lineHeight / textAutoResize |
+| `text.reflow` | `nodeId`, `width?`, `autoResize` (`HEIGHT`\|`NONE`\|`WIDTH_AND_HEIGHT`\|`TRUNCATE`) | before / after bounds |
+| `text.setStyle` | `nodeId`, `fontSize?`, `lineHeight?{value,unit}`, `letterSpacing?` | before / after bounds and applied values |
+| `text.setFont` | `nodeId`, `family`, `style` | before / after; warning if styles were mixed |
+| `text.setCharacters` | `nodeId`, `characters` | before / after; mixed-style warning |
+| `node.export` | `nodeId`, `scale?` (default 1) | PNG as Base64 (limits: 4096px per side, 8MB) |
 | `node.move` | `nodeId`, `x`, `y` | bounds |
 | `node.resize` | `nodeId`, `w`, `h` | bounds |
 
-`lineHeight.unit` は `AUTO` / `PIXELS` / `PERCENT`。
+`lineHeight.unit` is `AUTO` / `PIXELS` / `PERCENT`.
 
-返り値は必ず `{"ok":true,"method":...,"data":{...}}` か
-`{"ok":false,"error":"...","message":"..."}`。プラグイン側は例外を投げずエラーで返す（落ちない）。
+Responses are always `{"ok":true,"method":...,"data":{...}}` or
+`{"ok":false,"error":"...","message":"..."}`. The plugin never throws — it returns
+errors instead of crashing.
 
 ---
 
-## セキュリティ
+## Security
 
-- WS(3055) / HTTP(3056) はどちらも **127.0.0.1 のみ**にバインド。外部からは接続不可
-- 起動ごとにランダムトークンを発行。WS も HTTP も同じトークンを検証する
-- プラグインが実行できるのは `code.js` の `HANDLERS` に列挙したメソッドだけ（`eval` は無い）
-- 対象は **今開いているファイルの、指定した nodeId のノードのみ**。全体走査や削除の手段は持たせていない
-- リクエストは1件ずつ直列処理。文字数（20,000）・書き出しサイズ（4096px / 8MB）・HTTPボディ（2MB）に上限
-- トークンは `clientStorage` に保存しない（起動ごとに手貼り）
+- Both WS (3055) and HTTP (3056) bind to **127.0.0.1 only** — unreachable from outside the machine
+- A random token is issued per launch; both WS and HTTP verify the same token
+- The plugin can only run the methods listed in `HANDLERS` in `code.js` (no `eval`)
+- Scope is limited to **the currently open file and the explicitly given nodeId** — no whole-document scans, no delete operations
+- Requests are processed one at a time, with limits on text length (20,000 chars), export size (4096px / 8MB), and HTTP body (2MB)
+- The token is never stored in `clientStorage` (paste it manually on each launch)
 
-## 停止方法
+## Stopping
 
-1. Figma のプラグインパネルを閉じる（またはUIの「切断」）
-2. ターミナルで `Ctrl+C`（`broker/.token` は次回起動時に上書きされる）
+1. Close the Figma plugin panel (or press "Disconnect" in the UI)
+2. `Ctrl+C` in the terminal (`broker/.token` is overwritten on next launch)
 
-## 配線テスト（Figmaなしで確認したいとき）
+## Wiring test (without Figma)
 
 ```bash
-node broker/server.js          # 別ターミナルで起動しておく
-node broker/mock-plugin.js     # ダミーのプラグインとして接続
-# 上の curl 例が {"ok":true,...,"data":{"mock":true,...}} を返せば配線は正常
+node broker/server.js          # in one terminal
+node broker/mock-plugin.js     # connects as a dummy plugin
+# If the curl examples above return {"ok":true,...,"data":{"mock":true,...}}, the wiring is fine
 ```
 
-## 既知の制約
+## Known limitations
 
-- Figma のプラグインパネルを閉じると切断される（自動再接続はしない／UIの「接続」を押し直す）
-- `text.setCharacters` は全文置換。元が混在スタイルだと先頭スタイルに寄る（警告を返す）
-- ブローカーに接続できるプラグインは同時に1つ（後から接続したものが有効になる）
+- Closing the plugin panel disconnects the bridge (no auto-reconnect — press Connect again)
+- `text.setCharacters` replaces the whole text; mixed styles collapse to the first style (a warning is returned)
+- Only one plugin can be connected to the broker at a time (the latest connection wins)
