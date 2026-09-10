@@ -123,6 +123,12 @@ errors instead of crashing.
 - Requests are processed one at a time, with limits on text length (20,000 chars), export size (4096px / 8MB), and HTTP body (2MB)
 - The token is never stored in `clientStorage` (paste it manually on each launch)
 
+## Troubleshooting connection
+
+- **The token changes on every broker launch.** After restarting the broker, the old token fails auth — print the current one with `cat broker/.token` and paste it again
+- If you closed the plugin panel, reopen it and paste the latest token (closing the panel drops the WS connection)
+- Health check: `curl -s -H "X-Bridge-Token: $(cat broker/.token)" http://127.0.0.1:3056/status` — `plugin_connected: true` means ready
+
 ## Stopping
 
 1. Close the Figma plugin panel (or press "Disconnect" in the UI)

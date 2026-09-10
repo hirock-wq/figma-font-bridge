@@ -120,6 +120,12 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 - リクエストは1件ずつ直列処理。文字数（20,000）・書き出しサイズ（4096px / 8MB）・HTTPボディ（2MB）に上限
 - トークンは `clientStorage` に保存しない（起動ごとに手貼り）
 
+## つながらないとき
+
+- **トークンは起動ごとに変わる**。ブローカーを再起動したら、古いトークンでは認証に失敗する → `cat broker/.token` で最新を表示してコピーし直す
+- プラグインパネルを一度閉じたら、開き直してから最新トークンを貼る（閉じた時点でWS接続は切れている）
+- 状態確認: `curl -s -H "X-Bridge-Token: $(cat broker/.token)" http://127.0.0.1:3056/status` — `plugin_connected: true` なら準備完了
+
 ## 停止方法
 
 1. Figma のプラグインパネルを閉じる（またはUIの「切断」）
