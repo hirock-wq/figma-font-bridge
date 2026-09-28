@@ -8,7 +8,7 @@
 //   - リクエストは1件ずつ直列に処理する（同時実行でドキュメントが壊れないように）
 //   - 例外は投げずにエラーオブジェクトで返す（プラグインを落とさない）
 
-figma.showUI(__html__, { width: 340, height: 300 });
+figma.showUI(__html__, { width: 340, height: 330 });
 
 // ---------- 上限値（暴走防止） ----------
 const MAX_CHARS = 20000;        // setCharacters の最大文字数
@@ -254,4 +254,30 @@ figma.ui.onmessage = (msg) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === "rpc") enqueue(msg.id, msg.method, msg.params);
   if (msg.type === "close") figma.closePlugin("ブリッジを終了しました");
+  if (msg.type === "settings_load") loadSettings();
+  if (msg.type === "settings_save") saveSettings(msg.remember, msg.token);
 };
+
+// ---------- トークンの記憶（opt-in） ----------
+// 「トークンを記憶する」が ON のときだけ figma.clientStorage（このMacのFigma内・このプラグイン専用）に保存する。
+// OFF にしたら保存済みのトークンは消す。
+const STORAGE_KEY = "bridge_token";
+
+// 保存済みトークンを UI に渡す（無ければ null）
+async function loadSettings() {
+  let token = null;
+  try { token = await figma.clientStorage.getAsync(STORAGE_KEY); } catch (e) {}
+  const valid = typeof token === "string" && /^[0-9a-f]{32}$/.test(token);
+  figma.ui.postMessage({ type: "settings", remember: valid, token: valid ? token : null });
+}
+
+// 記憶する/しないを反映する
+async function saveSettings(remember, token) {
+  try {
+    if (remember && typeof token === "string" && /^[0-9a-f]{32}$/.test(token)) {
+      await figma.clientStorage.setAsync(STORAGE_KEY, token);
+    } else {
+      await figma.clientStorage.deleteAsync(STORAGE_KEY);
+    }
+  } catch (e) {}
+}

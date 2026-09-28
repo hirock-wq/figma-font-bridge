@@ -7,6 +7,8 @@
   h1 { font-size: 13px; margin: 0 0 10px; }
   label { display: block; margin: 8px 0 4px; font-weight: 600; }
   input { width: 100%; box-sizing: border-box; padding: 6px; border: 1px solid #ccc; border-radius: 4px; font: inherit; }
+  label.check { display: flex; align-items: center; gap: 6px; font-weight: 400; margin: 8px 0 0; cursor: pointer; }
+  label.check input { width: auto; margin: 0; }
   .row { display: flex; gap: 6px; margin-top: 10px; }
   button { flex: 1; padding: 7px; border: 1px solid #ccc; border-radius: 4px; background: #fff; font: inherit; cursor: pointer; }
   button.primary { background: #0d99ff; border-color: #0d99ff; color: #fff; }
@@ -23,6 +25,8 @@
 <label for="token">ブローカーのトークン（起動時に表示されたもの）</label>
 <input id="token" type="text" placeholder="例: 3f9a...（broker/.token の中身）" autocomplete="off" />
 
+<label class="check"><input id="remember" type="checkbox" /> トークンを記憶して、次回から自動で接続する</label>
+
 <div class="row">
   <button id="connect" class="primary">接続</button>
   <button id="disconnect">切断</button>
@@ -38,6 +42,20 @@
   const $ = (id) => document.getElementById(id);
   let socket = null;
   let retryTimer = null;
+  let autoRetry = false;        // 記憶モードで自動接続中なら、切れたら再試行する
+  const RETRY_MS = 5000;
+
+  // 記憶モードの切り替えを code.js に伝える（ON=保存 / OFF=削除）
+  function saveSettings() {
+    parent.postMessage({ pluginMessage: { type: "settings_save", remember: $("remember").checked, token: $("token").value.trim() } }, "*");
+  }
+
+  // 記憶モードのとき、少し待って再接続する
+  function scheduleRetry() {
+    if (!autoRetry || !$("remember").checked || retryTimer) return;
+    log(RETRY_MS / 1000 + "秒後に再接続します");
+    retryTimer = setTimeout(() => { retryTimer = null; connect(true); }, RETRY_MS);
+  }
 
   function log(msg) {
     const el = $("log");
@@ -49,25 +67,35 @@
     $("dot").className = "dot" + (kind ? " " + kind : "");
   }
 
-  function connect() {
+  function connect(isAuto) {
     const token = $("token").value.trim();
     if (!token) { setState("トークンを貼ってください", "err"); return; }
-    // トークンはこのUIの間だけ保持（clientStorage には書かない = 漏えい面積を増やさない）
+    // トークンは「記憶する」が ON のときだけ clientStorage に保存（既定 OFF = このUIの間だけ保持）
     disconnect(true);
+    autoRetry = $("remember").checked;
+    if (!isAuto) saveSettings();
     setState("接続中…");
-    try { socket = new WebSocket(WS_URL); }
+    // ハンドラは「この接続 s」だけを見る（古い接続のイベントが新しい接続の状態を壊さないように）
+    let s;
+    try { s = socket = new WebSocket(WS_URL); }
     catch (e) { setState("接続失敗: " + e, "err"); return; }
 
-    socket.onopen = () => {
-      socket.send(JSON.stringify({ type: "auth", token: token, info: { plugin: "local-font-bridge" } }));
+    s.onopen = () => {
+      if (socket !== s) return;
+      s.send(JSON.stringify({ type: "auth", token: token, info: { plugin: "local-font-bridge" } }));
       log("WebSocket オープン → 認証送信");
     };
 
-    socket.onmessage = (ev) => {
+    s.onmessage = (ev) => {
+      if (socket !== s) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
       if (msg.type === "auth_ok") { setState("接続済み（待機中）", "on"); log("認証OK"); return; }
-      if (msg.type === "auth_failed") { setState("トークンが違います", "err"); log("認証NG"); return; }
+      if (msg.type === "auth_failed") {
+        // トークン違いは再試行しても直らないので止める
+        autoRetry = false;
+        setState("トークンが違います（broker/.token の中身を貼り直してください）", "err"); log("認証NG"); return;
+      }
       if (msg.type === "rpc") {
         log("← " + msg.method);
         // フォントを触れるのは code.js 側だけなので、そのまま転送する
@@ -75,14 +103,17 @@
       }
     };
 
-    socket.onclose = () => {
-      if (socket) { setState("切断されました", "err"); log("WebSocket クローズ"); }
+    s.onclose = () => {
+      if (socket !== s) return;   // 手動切断・張り替え済みの古い接続は無視
       socket = null;
+      setState("切断されました", "err"); log("WebSocket クローズ");
+      scheduleRetry();
     };
-    socket.onerror = () => { setState("通信エラー（ブローカーは起動していますか）", "err"); };
+    s.onerror = () => { if (socket !== s) return; setState("通信エラー（ブローカーは起動していますか）", "err"); };
   }
 
   function disconnect(silent) {
+    if (!silent) autoRetry = false;   // 手動の切断では再接続しない
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
     if (socket) { const s = socket; socket = null; try { s.close(); } catch (e) {} }
     if (!silent) { setState("未接続"); log("切断しました"); }
@@ -92,6 +123,16 @@
   window.onmessage = (event) => {
     const msg = event.data && event.data.pluginMessage;
     if (!msg) return;
+    // 起動時: 記憶したトークンがあれば入れて自動接続
+    if (msg.type === "settings") {
+      $("remember").checked = !!msg.remember;
+      if (msg.remember && msg.token) {
+        $("token").value = msg.token;
+        log("記憶したトークンで自動接続します");
+        connect(true);
+      }
+      return;
+    }
     if (msg.type === "rpc_result") {
       log("→ 結果 " + (msg.result && msg.result.ok ? "ok" : "error"));
       if (socket && socket.readyState === 1) {
@@ -100,7 +141,11 @@
     }
   };
 
-  $("connect").onclick = connect;
+  $("connect").onclick = () => connect(false);
   $("disconnect").onclick = () => disconnect(false);
   $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+  $("remember").onchange = saveSettings;
+
+  // 起動時に記憶設定を問い合わせる
+  parent.postMessage({ pluginMessage: { type: "settings_load" } }, "*");
 </script>

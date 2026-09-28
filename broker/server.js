@@ -16,9 +16,37 @@ const DIR = __dirname;
 const TOKEN_FILE = path.join(DIR, ".token");
 const LOG_FILE = path.join(DIR, "bridge.log");
 
-// --- トークン発行（起動ごとに新規・ファイルは本人のみ読める権限） ---
-const TOKEN = crypto.randomBytes(16).toString("hex");
-fs.writeFileSync(TOKEN_FILE, TOKEN + "\n", { mode: 0o600 });
+// --- トークン発行 ---
+// 既定: 起動ごとに新規発行。
+// 再利用モード（環境変数 BRIDGE_REUSE_TOKEN=1 か引数 --reuse-token）: 既存の .token が正しい形式なら使い回す。
+//   → 常駐（launchd）で再起動してもプラグイン側に記憶したトークンが使い続けられる。
+const REUSE_TOKEN = process.env.BRIDGE_REUSE_TOKEN === "1" || process.argv.includes("--reuse-token");
+
+// 既存トークンを読む（無い・形式が違う場合は null）
+function readExistingToken() {
+  try {
+    const t = fs.readFileSync(TOKEN_FILE, "utf8").trim();
+    return /^[0-9a-f]{32}$/.test(t) ? t : null;
+  } catch { return null; }
+}
+
+let TOKEN = REUSE_TOKEN ? readExistingToken() : null;
+const TOKEN_REUSED = !!TOKEN;
+if (!TOKEN) TOKEN = crypto.randomBytes(16).toString("hex");
+
+// .token への書き込みは「2つのポートを両方確保できた後」に行う。
+// （二重起動でポート競合した側が、稼働中ブローカーの .token を上書きしないように）
+let listening = 0;
+function onListening() {
+  if (++listening < 2) return;
+  if (!TOKEN_REUSED) fs.writeFileSync(TOKEN_FILE, TOKEN + "\n", { mode: 0o600 });
+  try { fs.chmodSync(TOKEN_FILE, 0o600); } catch {}   // 権限は本人のみ（600）に揃える
+  console.log("");
+  console.log("=== このトークンを Figma プラグインUIの入力欄に貼ってください ===");
+  console.log(TOKEN);
+  console.log("（" + TOKEN_FILE + " にも保存済み）");
+  console.log("");
+}
 
 function log(...args) {
   const line = "[" + new Date().toISOString() + "] " + args.join(" ");
@@ -91,7 +119,20 @@ wsServer.on("upgrade", (req, socket) => {
   });
 });
 
-wsServer.listen(WS_PORT, "localhost", () => log("WS  listening ws://127.0.0.1:" + WS_PORT));
+// ポートが既に使われている場合（別のブローカーが起動中など）は、分かりやすく記録して終了する
+function onListenError(port) {
+  return (err) => {
+    if (err.code === "EADDRINUSE") {
+      log("ERROR: port " + port + " is already in use (another broker running?). Exiting. / ポート " + port + " は使用中です（ブローカーの二重起動？）。終了します");
+    } else {
+      log("ERROR: listen on " + port + " failed: " + err);
+    }
+    process.exit(1);
+  };
+}
+wsServer.on("error", onListenError(WS_PORT));
+
+wsServer.listen(WS_PORT, "localhost", () => { log("WS  listening ws://127.0.0.1:" + WS_PORT); onListening(); });
 
 // --- HTTP サーバ（Claude 用） ---
 const httpServer = http.createServer((req, res) => {
@@ -133,13 +174,13 @@ const httpServer = http.createServer((req, res) => {
   reply(404, { ok: false, error: "not_found" });
 });
 
+httpServer.on("error", onListenError(HTTP_PORT));
+
 httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
-  log("HTTP listening http://127.0.0.1:" + HTTP_PORT);
-  console.log("");
-  console.log("=== このトークンを Figma プラグインUIの入力欄に貼ってください ===");
-  console.log(TOKEN);
-  console.log("（" + TOKEN_FILE + " にも保存済み）");
-  console.log("");
+  log("HTTP listening http://127.0.0.1:" + HTTP_PORT + (TOKEN_REUSED ? " (token reused)" : " (new token)"));
+  onListening();
 });
 
 process.on("SIGINT", () => { log("shutdown"); process.exit(0); });
+// launchd の停止（bootout/unload）は SIGTERM で届く
+process.on("SIGTERM", () => { log("shutdown (SIGTERM)"); process.exit(0); });

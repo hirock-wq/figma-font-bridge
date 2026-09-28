@@ -21,7 +21,8 @@ Claude(Bash/curl) --HTTP 127.0.0.1:3056--> ブローカー --WS 127.0.0.1:3055--
 | `broker/server.js` | ブローカー本体（Node.js・依存パッケージなし） |
 | `broker/ws-min.js` | 最小 WebSocket サーバ実装（`ws` パッケージを入れずに済ませるため） |
 | `broker/mock-plugin.js` | Figma を起動せず配線だけ検証するモック |
-| `broker/.token` | 起動ごとに発行されるトークン（gitignore・600） |
+| `broker/.token` | 認証トークン（既定は起動ごとに発行・`BRIDGE_REUSE_TOKEN=1` で再利用／gitignore・600） |
+| `launchd/` | 常駐用テンプレートと `install.sh`（「常駐運用」参照） |
 | `broker/bridge.log` | 通信ログ |
 | `plugin/manifest.json` `plugin/code.js` `plugin/ui.html` | Figma 開発者プラグイン |
 
@@ -58,6 +59,56 @@ Figmaデスクトップアプリ（日本語UI）で:
 緑のドット＋「接続済み（待機中）」になれば準備完了。
 
 > プラグインパネルを閉じるとブリッジも切れる。作業中は開いたままにする。
+
+---
+
+## 常駐運用（launchd・任意）
+
+「ブローカー起動 → トークンをコピー → 貼る」を毎回しなくて済むようにする。初回設定後は
+**対象ファイルでプラグインを開くだけで自動接続** する。
+
+### 導入（1回だけ）
+
+```bash
+cd /path/to/figma-font-bridge
+bash launchd/install.sh
+```
+
+`launchd/com.example.figma-font-bridge.plist.template` のパス（リポジトリ・`node` の絶対パス（nvm 含む）・
+`~/Library/Logs`）を自動で埋めて `~/Library/LaunchAgents/com.<ユーザー名>.figma-font-bridge.plist` を作り、
+手動起動中のブローカーを止めてから登録する（`RunAtLoad`＋`KeepAlive`・`ThrottleInterval` 30秒）。
+ジョブ名は `BRIDGE_LABEL=...` で変更可。最後にトークンが表示される。
+
+プラグインでトークンを1回だけ貼り、**「トークンを記憶して、次回から自動で接続する」** に
+チェックして「接続」。以後はプラグインを開くと自動接続し、ブローカーが再起動しても5秒ごとに再接続する。
+
+### トークン固定（opt-in）
+
+常駐ジョブは `BRIDGE_REUSE_TOKEN=1`（= `node broker/server.js --reuse-token`）で起動する。
+既存の正しい `broker/.token` があれば作り直さずに使うので、再起動しても記憶したトークンが無効にならない。
+フラグなしの起動は従来どおり（起動ごとに新規発行）。
+
+安全性は実質同等: 両ポートは 127.0.0.1 のみ、`.token` は 600（本人のみ読める）、記憶したトークンは
+このMacの Figma 内・このプラグイン専用の `clientStorage` にだけ置かれる。違いは「再起動で失効しない」点。
+**トークンを変えたいときは** `broker/.token` を消してジョブを再起動し、新しいトークンを貼り直す。
+
+### 停止・登録解除・再起動
+
+```bash
+launchctl bootout gui/$(id -u)/com.$(id -un).figma-font-bridge    # 停止（旧書式: launchctl unload ~/Library/LaunchAgents/com.$(id -un).figma-font-bridge.plist）
+bash launchd/install.sh uninstall                                 # 停止＋plist 削除
+launchctl kickstart -k gui/$(id -u)/com.$(id -un).figma-font-bridge  # 再起動
+```
+
+### 常駐時のトラブルシュート
+
+- 稼働確認: `launchctl list | grep figma-font-bridge`（1列目に PID があれば稼働中）
+- ログ: `~/Library/Logs/figma-font-bridge.err.log` / `.out.log` と `broker/bridge.log`
+- ログに `port 3056 is already in use`: 別のブローカー（手動起動など）が動いている → それを止める。
+  launchd の再試行は最短30秒間隔なので再起動ループにはならない。ポート競合で落ちた側は `broker/.token` を上書きしない
+- プラグインに「トークンが違います」: `.token` が消えた／作り直された → `cat broker/.token` を貼り直す
+- 接続はできたが別のファイルに効く: 下の「つながらないとき」を参照（接続は1つだけ・最後に接続したものが勝つ）
+- リポジトリを移動した／Node を入れ替えたら `bash launchd/install.sh` を再実行
 
 ---
 
@@ -114,15 +165,15 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 ## セキュリティ
 
 - WS(3055) / HTTP(3056) はどちらも **127.0.0.1 のみ**にバインド。外部からは接続不可
-- 起動ごとにランダムトークンを発行。WS も HTTP も同じトークンを検証する
+- 起動ごとにランダムトークンを発行（常駐運用では再利用）。WS も HTTP も同じトークンを検証する
 - プラグインが実行できるのは `code.js` の `HANDLERS` に列挙したメソッドだけ（`eval` は無い）
 - 対象は **今開いているファイルの、指定した nodeId のノードのみ**。全体走査や削除の手段は持たせていない
 - リクエストは1件ずつ直列処理。文字数（20,000）・書き出しサイズ（4096px / 8MB）・HTTPボディ（2MB）に上限
-- トークンは `clientStorage` に保存しない（起動ごとに手貼り）
+- トークンは「記憶する」にチェックしたときだけ `clientStorage` に保存（既定 OFF・外すと削除）
 
 ## つながらないとき
 
-- **トークンは起動ごとに変わる**。ブローカーを再起動したら、古いトークンでは認証に失敗する → `cat broker/.token` で最新を表示してコピーし直す
+- **既定ではトークンは起動ごとに変わる**（常駐運用では変わらない）。ブローカーを再起動したら、古いトークンでは認証に失敗する → `cat broker/.token` で最新を表示してコピーし直す
 - プラグインパネルを一度閉じたら、開き直してから最新トークンを貼る（閉じた時点でWS接続は切れている）
 - 状態確認: `curl -s -H "X-Bridge-Token: $(cat broker/.token)" http://127.0.0.1:3056/status` — `plugin_connected: true` なら準備完了
 
@@ -141,6 +192,6 @@ node broker/mock-plugin.js     # ダミーのプラグインとして接続
 
 ## 既知の制約
 
-- Figma のプラグインパネルを閉じると切断される（自動再接続はしない／UIの「接続」を押し直す）
+- Figma のプラグインパネルを閉じると切断される（「記憶する」ON なら開き直すと自動接続／OFF なら「接続」を押し直す）
 - `text.setCharacters` は全文置換。元が混在スタイルだと先頭スタイルに寄る（警告を返す）
 - ブローカーに接続できるプラグインは同時に1つ（後から接続したものが有効になる）
