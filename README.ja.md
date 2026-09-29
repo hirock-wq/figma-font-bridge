@@ -21,10 +21,12 @@ Claude(Bash/curl) --HTTP 127.0.0.1:3056--> ブローカー --WS 127.0.0.1:3055--
 | `broker/server.js` | ブローカー本体（Node.js・依存パッケージなし） |
 | `broker/ws-min.js` | 最小 WebSocket サーバ実装（`ws` パッケージを入れずに済ませるため） |
 | `broker/mock-plugin.js` | Figma を起動せず配線だけ検証するモック |
+| `broker/script-gate.js` | `script.run` の関所（opt-in 判定。「スクリプトモード（opt-in）」参照） |
 | `broker/.token` | 認証トークン（既定は起動ごとに発行・`BRIDGE_REUSE_TOKEN=1` で再利用／gitignore・600） |
 | `launchd/` | 常駐用テンプレートと `install.sh`（「常駐運用」参照） |
 | `broker/bridge.log` | 通信ログ |
 | `plugin/manifest.json` `plugin/code.js` `plugin/ui.html` | Figma 開発者プラグイン |
+| `test/script_run.test.js` | スクリプトモードのテスト（Node のみ・Figma 不要・常駐ブローカーに触れない） |
 
 ---
 
@@ -154,6 +156,7 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 | `node.export` | `nodeId`, `scale?`(既定1) | PNG の Base64（4096px/辺・8MB上限） |
 | `node.move` | `nodeId`, `x`, `y` | bounds |
 | `node.resize` | `nodeId`, `w`, `h` | bounds |
+| `script.run` | `code`, `args?`, `timeoutMs?`（既定 60000） | スクリプトの戻り値（JSON 安全化済み）— **opt-in・既定では拒否**。「スクリプトモード（opt-in）」参照 |
 
 `lineHeight.unit` は `AUTO` / `PIXELS` / `PERCENT`。
 
@@ -162,11 +165,106 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 
 ---
 
+## スクリプトモード（opt-in）
+
+`script.run` は、Figma デスクトップのプラグイン内で任意の Plugin API コード（JavaScript）を実行する。
+いわば **ローカル実行版の `use_figma`**。自分のMac上で動くので、クラウド実行の MCP の弱点を避けられる:
+
+- **ローカルフォントが見える**（`listAvailableFontsAsync` / `loadFontAsync` に Adobe Fonts・購入フォント・OS フォントが出る）
+- **メタデータ反映のラグが無い**（編集直後の読み取りに即反映。クラウド側は約1分遅れることがある）
+- **全ロールバックにならない**（1行ずつその場で反映。途中で失敗しても、それまでの変更は残る）
+- **ページ切替の制限が無い**（`documentAccess: "dynamic-page"` なので `await page.loadAsync()` / `figma.setCurrentPageAsync()` が使える）
+
+**既定は OFF**。スクリプトモードを有効にして起動していないブローカーは、`script.run` を HTTP 403
+`{"ok":false,"error":"script_disabled",...}` で拒否する。ほかのメソッドは設定に関係なく従来どおり動く。
+
+### 有効化
+
+```bash
+node broker/server.js --allow-script            # 手動起動（フラグ）
+BRIDGE_ALLOW_SCRIPT=1 node broker/server.js     # 手動起動（環境変数）
+BRIDGE_ALLOW_SCRIPT=1 bash launchd/install.sh   # 常駐運用（plist に BRIDGE_ALLOW_SCRIPT=1 を書き込む）
+bash launchd/install.sh                         # 付けずに再実行すると無効（0）に戻る
+```
+
+ブローカーは起動時に `allow_script: true|false` をログに出し、`/status` にも `"allow_script": true|false` が入る。
+常駐運用ではトークンが再利用されるので、入れ直してもプラグインに記憶したトークンはそのまま使える。
+
+### 呼び出し方
+
+`params`: `code`（文字列・必須）、`args`（任意の JSON・省略可）、`timeoutMs`（省略可・既定 60000・最大 600000）。
+`code` は `async function (figma, args, helpers) { ... }` の中身として実行される。`return` した値が `data` で返る。
+
+```bash
+T=$(cat broker/.token)
+
+# 今のページの全 TEXT ノードの位置サイズを一括取得
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"script.run","params":{"code":"return figma.currentPage.findAll(n => n.type === \"TEXT\").map(n => helpers.boundsOf(n))"}}' \
+  http://127.0.0.1:3056/rpc
+
+# 引数を渡す例: 1つのノードにローカルフォントを当てる
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"script.run","params":{"args":{"id":"123:456","family":"Mizolet","style":"Regular"},"code":"const n = await helpers.getNode(args.id, \"TEXT\"); await helpers.loadFontsOf(n); await figma.loadFontAsync({family: args.family, style: args.style}); n.fontName = {family: args.family, style: args.style}; return helpers.boundsOf(n)"}}' \
+  http://127.0.0.1:3056/rpc
+```
+
+長いスクリプトは JSON ボディをファイルに書いて `curl ... --data-binary @body.json` で送ると楽。
+
+### `helpers`
+
+| helper | 内容 |
+|---|---|
+| `getNode(nodeId, expectType?)` | id からノードを取得（無い・型違いは例外） |
+| `loadFontsOf(textNode)` | テキストが使う全フォント（混在含む）をロードして返す |
+| `fontsOf(textNode)` | テキストが使うフォント一覧（ロードはしない） |
+| `boundsOf(node)` | `{id, name, x, y, width, height}`（0.01 単位に丸め） |
+| `exportPng(nodeかid, scale?)` | `node.export` と同じ `{node, format, scale, bytes, base64}`（4096px / 8MB 上限） |
+
+### 返り値とエラー
+
+戻り値は JSON で安全に送れる形に変換される: 循環参照 → `"[Circular]"`、BigInt → 文字列、
+`undefined`・関数・Symbol は落とす（配列内は `null`）、`figma.mixed` → `"MIXED"`、
+ノードをそのまま返すと `{id, type, name}`、`Date` → ISO 文字列、型付き配列 → 数値配列。
+何も返さなければ `data: null`。
+
+| error | 条件 |
+|---|---|
+| `script_disabled`（HTTP 403・ブローカーが返す） | スクリプトモードが OFF |
+| `script_error`（`message` / `name` / `stack`） | スクリプトが例外を投げた・構文エラー |
+| `script_timeout`（`timeoutMs`） | `timeoutMs` 以内に終わらなかった |
+| `code_too_large`（`bytes` / `limit`） | `code` が 200KB（UTF-8）超 |
+| `result_too_large`（`bytes` / `limit`） | 戻り値の JSON が 2MB 超 |
+| `handler_error` | `code` が無い・`timeoutMs` が不正 |
+
+いずれの場合もプラグインは落ちない。
+
+### 制限
+
+- タイムアウト: 既定 60 秒・最大 10 分。時間切れでも応答は返るが、**スクリプト自体は止められない**
+  （裏で動き続けることがあり、それまでの変更は残る）
+- サイズ: `code` 200KB・戻り値 2MB・HTTP ボディ 2MB（従来どおり）
+- リクエストは引き続き1件ずつ直列処理（スクリプトが終わるかタイムアウトするまで、ほかの呼び出しは待つ）
+- ブローカーは `script.run` だけ `timeoutMs + 5秒` まで待つ（既存メソッドは従来の 30 秒）
+
+### セキュリティ
+
+スクリプトモードは Figma セッション内での **任意コード実行**。開いているファイルを何でも読み書きでき、
+ブローカーを呼べる相手にはその力が渡る。
+
+- 既定 OFF。有効にするのは自分専用のMacだけ。**共用PC・公開PCでは有効にしない**
+- 127.0.0.1 限定のバインドと毎リクエストのトークン検証は従来どおり。ただしスクリプトモードを有効にしたMacでは
+  `broker/.token` をパスワードと同じ扱いにする
+- 使わせるのは信頼できる呼び出し元（自分のエージェント・スクリプト）だけ。信頼できない文字列を `code` に流し込まない
+- 無効に戻すには、フラグなしでブローカーを再起動するか `bash launchd/install.sh` を再実行する
+
+---
+
 ## セキュリティ
 
 - WS(3055) / HTTP(3056) はどちらも **127.0.0.1 のみ**にバインド。外部からは接続不可
 - 起動ごとにランダムトークンを発行（常駐運用では再利用）。WS も HTTP も同じトークンを検証する
-- プラグインが実行できるのは `code.js` の `HANDLERS` に列挙したメソッドだけ（`eval` は無い）
+- プラグインが実行できるのは `code.js` の `HANDLERS` に列挙したメソッドだけ（`eval` は無い。例外は opt-in の `script.run` で、ブローカーを `--allow-script` / `BRIDGE_ALLOW_SCRIPT=1` で起動しない限り拒否される）
 - 対象は **今開いているファイルの、指定した nodeId のノードのみ**。全体走査や削除の手段は持たせていない
 - リクエストは1件ずつ直列処理。文字数（20,000）・書き出しサイズ（4096px / 8MB）・HTTPボディ（2MB）に上限
 - トークンは「記憶する」にチェックしたときだけ `clientStorage` に保存（既定 OFF・外すと削除）
@@ -188,6 +286,13 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 node broker/server.js          # 別ターミナルで起動しておく
 node broker/mock-plugin.js     # ダミーのプラグインとして接続
 # 上の curl 例が {"ok":true,...,"data":{"mock":true,...}} を返せば配線は正常
+```
+
+スクリプトモードのテスト（Node のみ。空きポートと一時フォルダで専用ブローカーを起動するので、
+常駐ブローカー・3055/3056・`broker/.token` には触れない）:
+
+```bash
+node test/script_run.test.js   # exit 0 なら全件合格
 ```
 
 ## 既知の制約

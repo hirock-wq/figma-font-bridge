@@ -7,12 +7,20 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const ws = require("./ws-min");
+const { resolveAllowScript, gateRpc, rpcWaitMs } = require("./script-gate");
 
-const WS_PORT = 3055;    // プラグイン接続用
-const HTTP_PORT = 3056;  // Claude 呼び出し用
+// ポートと保存先は固定（プラグインの manifest / ui.html もこのポートを前提にしている）。
+// BRIDGE_WS_PORT / BRIDGE_HTTP_PORT / BRIDGE_STATE_DIR は test/ が常駐ブローカーとぶつからないよう
+// 別ポート・一時フォルダで起動するためだけの上書き口（普段は指定しない）。
+const WS_PORT = Number(process.env.BRIDGE_WS_PORT) || 3055;      // プラグイン接続用
+const HTTP_PORT = Number(process.env.BRIDGE_HTTP_PORT) || 3056;  // Claude 呼び出し用
 const TIMEOUT_MS = 30000;
 
-const DIR = __dirname;
+// スクリプトモード（script.run = 任意コード実行）。既定は OFF＝ブローカーが 403 で拒否する。
+// 許可するのは起動引数 --allow-script か 環境変数 BRIDGE_ALLOW_SCRIPT=1 のときだけ。
+const ALLOW_SCRIPT = resolveAllowScript(process.argv, process.env);
+
+const DIR = process.env.BRIDGE_STATE_DIR || __dirname;   // .token と bridge.log の置き場
 const TOKEN_FILE = path.join(DIR, ".token");
 const LOG_FILE = path.join(DIR, "bridge.log");
 
@@ -60,7 +68,7 @@ let pluginInfo = null;         // プラグインが名乗った情報
 const pending = new Map();     // リクエストID -> {resolve, timer}
 let seq = 0;
 
-function sendToPlugin(method, params) {
+function sendToPlugin(method, params, waitMs) {
   return new Promise((resolve) => {
     if (!pluginSocket) {
       resolve({ ok: false, error: "plugin_not_connected", hint: "Figmaでプラグインを起動しトークンを貼ってください" });
@@ -70,7 +78,7 @@ function sendToPlugin(method, params) {
     const timer = setTimeout(() => {
       pending.delete(id);
       resolve({ ok: false, error: "timeout", method });
-    }, TIMEOUT_MS);
+    }, waitMs || TIMEOUT_MS);
     pending.set(id, { resolve, timer });
     try {
       ws.send(pluginSocket, JSON.stringify({ type: "rpc", id, method, params: params || {} }));
@@ -147,7 +155,7 @@ const httpServer = http.createServer((req, res) => {
   if (given !== TOKEN) { reply(401, { ok: false, error: "bad_token" }); return; }
 
   if (req.method === "GET" && req.url.startsWith("/status")) {
-    reply(200, { ok: true, plugin_connected: !!pluginSocket, plugin: pluginInfo, pending: pending.size });
+    reply(200, { ok: true, plugin_connected: !!pluginSocket, plugin: pluginInfo, pending: pending.size, allow_script: ALLOW_SCRIPT });
     return;
   }
 
@@ -163,8 +171,11 @@ const httpServer = http.createServer((req, res) => {
       let parsed;
       try { parsed = JSON.parse(body || "{}"); } catch { reply(400, { ok: false, error: "bad_json" }); return; }
       if (!parsed.method) { reply(400, { ok: false, error: "method_required" }); return; }
+      // script.run はスクリプトモードを許可して起動したときだけ通す
+      const blocked = gateRpc(parsed.method, ALLOW_SCRIPT);
+      if (blocked) { log("rpc x ", parsed.method, "rejected:", blocked.body.error); reply(blocked.status, blocked.body); return; }
       log("rpc ->", parsed.method, JSON.stringify(parsed.params || {}).slice(0, 300));
-      const result = await sendToPlugin(parsed.method, parsed.params);
+      const result = await sendToPlugin(parsed.method, parsed.params, rpcWaitMs(parsed.method, parsed.params, TIMEOUT_MS));
       log("rpc <-", parsed.method, JSON.stringify(result).slice(0, 300));
       reply(200, result);
     });
@@ -178,6 +189,7 @@ httpServer.on("error", onListenError(HTTP_PORT));
 
 httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
   log("HTTP listening http://127.0.0.1:" + HTTP_PORT + (TOKEN_REUSED ? " (token reused)" : " (new token)"));
+  log("allow_script: " + ALLOW_SCRIPT + (ALLOW_SCRIPT ? " (script.run enabled / 任意コード実行を許可)" : " (script.run is rejected with 403 / 既定拒否)"));
   onListening();
 });
 

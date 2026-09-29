@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- figma-font-bridge ブローカー常駐用 launchd テンプレート。
-     __LABEL__ / __NODE__ / __REPO__ / __LOG_DIR__ は launchd/install.sh が自動で置き換える。 -->
+     __LABEL__ / __NODE__ / __REPO__ / __LOG_DIR__ / __ALLOW_SCRIPT__ は launchd/install.sh が自動で置き換える。
+     BRIDGE_ALLOW_SCRIPT: 1 = script.run（任意コード実行）を許可 / 0 = 拒否（既定）。
+     install.sh を BRIDGE_ALLOW_SCRIPT=1 付きで実行したときだけ 1 になる。 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -17,6 +19,8 @@
   <dict>
     <key>BRIDGE_REUSE_TOKEN</key>
     <string>1</string>
+    <key>BRIDGE_ALLOW_SCRIPT</key>
+    <string>__ALLOW_SCRIPT__</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

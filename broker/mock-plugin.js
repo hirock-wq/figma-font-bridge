@@ -6,12 +6,17 @@ const path = require("path");
 const crypto = require("crypto");
 const net = require("net");
 
-const TOKEN = fs.readFileSync(path.join(__dirname, ".token"), "utf8").trim();
+// BRIDGE_WS_PORT / BRIDGE_STATE_DIR は test/ 用の上書き口（server.js と同じ意味。普段は指定しない）
+const WS_PORT = Number(process.env.BRIDGE_WS_PORT) || 3055;
+const STATE_DIR = process.env.BRIDGE_STATE_DIR || __dirname;
+const TOKEN = fs.readFileSync(path.join(STATE_DIR, ".token"), "utf8").trim();
 const key = crypto.randomBytes(16).toString("base64");
 
-const socket = net.connect(3055, "127.0.0.1", () => {
+// server.js の WS は "localhost" で待ち受ける（macOS では ::1 になることがある）ので、
+// 本物のプラグインUI（ws://localhost:3055）と同じく "localhost" に接続する（IPv4/IPv6 は自動で選ばれる）
+const socket = net.connect({ port: WS_PORT, host: "localhost", autoSelectFamily: true }, () => {
   socket.write(
-    "GET / HTTP/1.1\r\nHost: 127.0.0.1:3055\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+    "GET / HTTP/1.1\r\nHost: localhost:" + WS_PORT + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
     "Sec-WebSocket-Key: " + key + "\r\nSec-WebSocket-Version: 13\r\n\r\n"
   );
 });
@@ -55,11 +60,15 @@ socket.on("data", (chunk) => {
     buf = buf.slice(offset + len);
     let msg; try { msg = JSON.parse(text); } catch { continue; }
     console.log("[mock] recv:", text.slice(0, 200));
-    if (msg.type === "rpc") {
+    if (msg.type === "rpc" && msg.method === "script.run") {
+      // script.run はコードを実行せず、届いた code / args / timeoutMs をそのまま返す（配線確認用）
+      send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: { mock: true, script: true, echo: msg.params } } });
+    } else if (msg.type === "rpc") {
       // 本物の code.js の代わりにダミーの結果を返す
       send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: { mock: true, params: msg.params } } });
     }
   }
 });
 
+socket.on("close", () => process.exit(0));   // ブローカーが止まったら一緒に終わる
 socket.on("error", (e) => { console.error("[mock] error", e.message); process.exit(1); });

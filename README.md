@@ -23,10 +23,12 @@ Agent (curl) --HTTP 127.0.0.1:3056--> broker --WS 127.0.0.1:3055--> plugin UI --
 | `broker/server.js` | The broker (Node.js, zero dependencies) |
 | `broker/ws-min.js` | Minimal WebSocket server implementation (avoids the `ws` package) |
 | `broker/mock-plugin.js` | Mock plugin to test the wiring without launching Figma |
+| `broker/script-gate.js` | The opt-in gate for `script.run` (see "Script mode (opt-in)") |
 | `broker/.token` | Auth token (per launch by default, reusable with `BRIDGE_REUSE_TOKEN=1`; gitignored, mode 600) |
 | `launchd/` | Always-on template + `install.sh` (see "Always-on mode") |
 | `broker/bridge.log` | Communication log |
 | `plugin/manifest.json` `plugin/code.js` `plugin/ui.html` | The Figma development plugin |
+| `test/script_run.test.js` | Node-only tests for script mode (no Figma, does not touch the running broker) |
 
 ---
 
@@ -161,6 +163,7 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
 | `node.export` | `nodeId`, `scale?` (default 1) | PNG as Base64 (limits: 4096px per side, 8MB) |
 | `node.move` | `nodeId`, `x`, `y` | bounds |
 | `node.resize` | `nodeId`, `w`, `h` | bounds |
+| `script.run` | `code`, `args?`, `timeoutMs?` (default 60000) | the script's return value (JSON-safe) — **opt-in, rejected by default**; see "Script mode (opt-in)" |
 
 `lineHeight.unit` is `AUTO` / `PIXELS` / `PERCENT`.
 
@@ -170,11 +173,108 @@ errors instead of crashing.
 
 ---
 
+## Script mode (opt-in)
+
+`script.run` executes arbitrary Plugin API JavaScript inside the Figma desktop plugin — a
+**local-execution counterpart to `use_figma`**. Because it runs on your machine, it avoids the
+weak spots of the cloud-side MCP:
+
+- **Local fonts are visible** (`listAvailableFontsAsync` / `loadFontAsync` see Adobe Fonts, purchased and OS fonts)
+- **No metadata lag** — reads reflect edits immediately (the cloud side can lag ~1 minute)
+- **No all-or-nothing rollback** — each statement takes effect as it runs (a failure mid-script keeps earlier changes)
+- **No page-switching restriction** — the plugin uses `documentAccess: "dynamic-page"`, so `await page.loadAsync()` / `figma.setCurrentPageAsync()` work
+
+It is **off by default**: the broker rejects `script.run` with HTTP 403
+`{"ok":false,"error":"script_disabled",...}` unless it was started with script mode enabled.
+All other methods behave exactly as before, whatever the setting.
+
+### Enabling
+
+```bash
+node broker/server.js --allow-script            # manual start, flag
+BRIDGE_ALLOW_SCRIPT=1 node broker/server.js     # manual start, env
+BRIDGE_ALLOW_SCRIPT=1 bash launchd/install.sh   # always-on mode (writes BRIDGE_ALLOW_SCRIPT=1 into the plist)
+bash launchd/install.sh                         # re-run without it to switch back to disabled (0)
+```
+
+The broker logs `allow_script: true|false` at startup, and `/status` includes `"allow_script": true|false`.
+The token is reused across the reinstall in always-on mode, so a remembered token keeps working.
+
+### Calling it
+
+`params`: `code` (string, required), `args` (any JSON, optional), `timeoutMs` (optional, default 60000, max 600000).
+`code` is the body of `async function (figma, args, helpers) { ... }` — `return` a value and it comes back as `data`.
+
+```bash
+T=$(cat broker/.token)
+
+# Bounds of every TEXT node on the current page
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"script.run","params":{"code":"return figma.currentPage.findAll(n => n.type === \"TEXT\").map(n => helpers.boundsOf(n))"}}' \
+  http://127.0.0.1:3056/rpc
+
+# Pass arguments: set a local font on one node
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"script.run","params":{"args":{"id":"123:456","family":"Mizolet","style":"Regular"},"code":"const n = await helpers.getNode(args.id, \"TEXT\"); await helpers.loadFontsOf(n); await figma.loadFontAsync({family: args.family, style: args.style}); n.fontName = {family: args.family, style: args.style}; return helpers.boundsOf(n)"}}' \
+  http://127.0.0.1:3056/rpc
+```
+
+For longer scripts, write the JSON body to a file and send it with `curl ... --data-binary @body.json`.
+
+### `helpers`
+
+| helper | does |
+|---|---|
+| `getNode(nodeId, expectType?)` | node by id (throws if missing / wrong type) |
+| `loadFontsOf(textNode)` | loads every font the text uses (incl. mixed ranges), returns them |
+| `fontsOf(textNode)` | fonts used by the text, without loading |
+| `boundsOf(node)` | `{id, name, x, y, width, height}` (rounded to 0.01) |
+| `exportPng(nodeOrId, scale?)` | same as `node.export`: `{node, format, scale, bytes, base64}` (4096px / 8MB limits) |
+
+### Results and errors
+
+The return value is made JSON-safe: circular references → `"[Circular]"`, BigInt → string,
+`undefined` / functions / symbols dropped (`null` inside arrays), `figma.mixed` → `"MIXED"`,
+nodes returned directly → `{id, type, name}`, `Date` → ISO string, typed arrays → number arrays.
+Returning nothing gives `data: null`.
+
+| error | when |
+|---|---|
+| `script_disabled` (HTTP 403, from the broker) | script mode is off |
+| `script_error` (`message`, `name`, `stack`) | the script threw, or has a syntax error |
+| `script_timeout` (`timeoutMs`) | not finished within `timeoutMs` |
+| `code_too_large` (`bytes`, `limit`) | `code` over 200KB (UTF-8) |
+| `result_too_large` (`bytes`, `limit`) | JSON-encoded result over 2MB |
+| `handler_error` | missing `code` or invalid `timeoutMs` |
+
+The plugin never crashes on any of these.
+
+### Limits
+
+- Timeout: default 60s, max 10 min. On timeout the response is returned, but **the script itself cannot be
+  cancelled** — it may keep running in the background, and whatever it already changed stays changed
+- Sizes: `code` 200KB, result 2MB, HTTP body 2MB (unchanged)
+- Requests are still processed one at a time (a script blocks other calls until it finishes or times out)
+- The broker waits `timeoutMs + 5s` for `script.run` (existing methods keep the 30s wait)
+
+### Security
+
+Script mode is **arbitrary code execution** inside your Figma session: it can read and modify any open
+file, and anything that can call the broker gets that power.
+
+- Off by default; enable it only on your own machine, **never on a shared or public computer**
+- The usual guards still apply: 127.0.0.1-only binding and the token on every request — but on a machine
+  where script mode is on, treat `broker/.token` like a password
+- Only let trusted callers (your own agent / scripts) use it; don't pipe untrusted text into `code`
+- To turn it off again: restart the broker without the flag, or re-run `bash launchd/install.sh`
+
+---
+
 ## Security
 
 - Both WS (3055) and HTTP (3056) bind to **127.0.0.1 only** — unreachable from outside the machine
 - A random token is issued per launch (or reused in always-on mode); both WS and HTTP verify the same token
-- The plugin can only run the methods listed in `HANDLERS` in `code.js` (no `eval`)
+- The plugin can only run the methods listed in `HANDLERS` in `code.js` (no `eval` — except the opt-in `script.run`, which the broker rejects unless started with `--allow-script` / `BRIDGE_ALLOW_SCRIPT=1`)
 - Scope is limited to **the currently open file and the explicitly given nodeId** — no whole-document scans, no delete operations
 - Requests are processed one at a time, with limits on text length (20,000 chars), export size (4096px / 8MB), and HTTP body (2MB)
 - The token is stored in `clientStorage` only when you tick "remember" (off by default; unticking deletes it)
@@ -196,6 +296,13 @@ errors instead of crashing.
 node broker/server.js          # in one terminal
 node broker/mock-plugin.js     # connects as a dummy plugin
 # If the curl examples above return {"ok":true,...,"data":{"mock":true,...}}, the wiring is fine
+```
+
+Script mode tests (Node only; they start their own brokers on free ports with a temp token dir,
+so they never touch the running broker, ports 3055/3056 or `broker/.token`):
+
+```bash
+node test/script_run.test.js   # exit 0 = all passed
 ```
 
 ## Known limitations
