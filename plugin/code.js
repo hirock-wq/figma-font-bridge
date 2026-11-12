@@ -415,8 +415,32 @@ figma.ui.onmessage = (msg) => {
   if (msg.type === "rpc") enqueue(msg.id, msg.method, msg.params);
   if (msg.type === "close") figma.closePlugin("ブリッジを終了しました");
   if (msg.type === "settings_load") loadSettings();
+  if (msg.type === "info_request") postFileInfo();
   if (msg.type === "settings_save") saveSettings(msg.remember, msg.token);
 };
+
+// ---------- このプラグインが動いているファイルの名乗り ----------
+// 複数の Figma ファイルで同時にプラグインを開いたとき、ブローカーが送り先を選べるように
+// 「ファイル名・ページ名・ファイルキー」を UI 経由でブローカーへ伝える。
+function fileInfo() {
+  let key = null;
+  try { key = figma.fileKey || null; } catch (e) {}   // 環境によっては取得できない（その場合は null）
+  return { plugin: "local-font-bridge", file_name: figma.root.name, page_name: figma.currentPage.name, file_key: key };
+}
+
+let lastInfoJson = "";
+function postFileInfo() {
+  const info = fileInfo();
+  lastInfoJson = JSON.stringify(info);
+  figma.ui.postMessage({ type: "info", info: info });
+}
+
+// ファイル名の変更・ページ切り替えを 3 秒ごとに見て、変わったときだけ伝え直す
+if (typeof setInterval === "function") {
+  setInterval(() => {
+    try { if (JSON.stringify(fileInfo()) !== lastInfoJson) postFileInfo(); } catch (e) {}
+  }, 3000);
+}
 
 // ---------- トークンの記憶（opt-in） ----------
 // 「トークンを記憶する」が ON のときだけ figma.clientStorage（このMacのFigma内・このプラグイン専用）に保存する。
@@ -428,6 +452,7 @@ async function loadSettings() {
   let token = null;
   try { token = await figma.clientStorage.getAsync(STORAGE_KEY); } catch (e) {}
   const valid = typeof token === "string" && /^[0-9a-f]{32}$/.test(token);
+  postFileInfo();   // 自動接続より先にファイル情報を渡しておく
   figma.ui.postMessage({ type: "settings", remember: valid, token: valid ? token : null });
 }
 

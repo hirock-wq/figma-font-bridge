@@ -149,6 +149,27 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   http://127.0.0.1:3056/rpc
 ```
 
+### Working with several Figma files at once
+
+Figma runs a separate plugin instance per file (tab). **Open the plugin in every file you want to use and they all stay connected at the same time** (the plugin status shows the file name it is connected as).
+
+- `/status` lists every connected file under `plugins` (`id`, `file_name`, `page_name`, `file_key`)
+- Add `"target"` to the `/rpc` body to choose the destination: **file name, file key, or connection id** (exact match)
+- With a single connection `target` is optional (same as before)
+- With two or more connections and no `target`, the broker **forwards nothing** and returns `target_required` (so the wrong file is never edited)
+
+```bash
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"selection.get","target":"My File"}' http://127.0.0.1:3056/rpc
+```
+
+| Error | Meaning |
+|---|---|
+| `target_required` | Several plugins are connected and no `target` was given (candidates are in `plugins`) |
+| `target_not_found` | The plugin is not open in that file |
+| `target_ambiguous` | Several connected files share that name — use the connection `id` |
+| `plugin_disconnected` | The plugin disconnected while the request was running |
+
 ### Methods
 
 | method | params | returns |

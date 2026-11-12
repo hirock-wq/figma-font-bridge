@@ -42,6 +42,8 @@
   const $ = (id) => document.getElementById(id);
   let socket = null;
   let retryTimer = null;
+  let fileInfo = { plugin: "local-font-bridge" };   // code.js から届く「このファイルの名前・ページ名」
+  let authed = false;           // ブローカーの認証が通っているか
   let autoRetry = false;        // 記憶モードで自動接続中なら、切れたら再試行する
   const RETRY_MS = 5000;
 
@@ -67,6 +69,11 @@
     $("dot").className = "dot" + (kind ? " " + kind : "");
   }
 
+  // 接続中の表示（どのファイルとしてつながっているかを出す）
+  function showConnected() {
+    setState("接続済み: " + (fileInfo.file_name || "（ファイル名不明）"), "on");
+  }
+
   function connect(isAuto) {
     const token = $("token").value.trim();
     if (!token) { setState("トークンを貼ってください", "err"); return; }
@@ -82,7 +89,7 @@
 
     s.onopen = () => {
       if (socket !== s) return;
-      s.send(JSON.stringify({ type: "auth", token: token, info: { plugin: "local-font-bridge" } }));
+      s.send(JSON.stringify({ type: "auth", token: token, info: fileInfo }));
       log("WebSocket オープン → 認証送信");
     };
 
@@ -90,7 +97,7 @@
       if (socket !== s) return;
       let msg;
       try { msg = JSON.parse(ev.data); } catch { return; }
-      if (msg.type === "auth_ok") { setState("接続済み（待機中）", "on"); log("認証OK"); return; }
+      if (msg.type === "auth_ok") { authed = true; showConnected(); log("認証OK" + (msg.id ? "（接続ID " + msg.id + "）" : "")); return; }
       if (msg.type === "auth_failed") {
         // トークン違いは再試行しても直らないので止める
         autoRetry = false;
@@ -105,7 +112,7 @@
 
     s.onclose = () => {
       if (socket !== s) return;   // 手動切断・張り替え済みの古い接続は無視
-      socket = null;
+      socket = null; authed = false;
       setState("切断されました", "err"); log("WebSocket クローズ");
       scheduleRetry();
     };
@@ -115,6 +122,7 @@
   function disconnect(silent) {
     if (!silent) autoRetry = false;   // 手動の切断では再接続しない
     if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    authed = false;
     if (socket) { const s = socket; socket = null; try { s.close(); } catch (e) {} }
     if (!silent) { setState("未接続"); log("切断しました"); }
   }
@@ -130,6 +138,15 @@
         $("token").value = msg.token;
         log("記憶したトークンで自動接続します");
         connect(true);
+      }
+      return;
+    }
+    // このファイルの名前・ページ名（起動時と、変わったときに届く）。接続中ならブローカーにも伝える
+    if (msg.type === "info") {
+      fileInfo = msg.info || fileInfo;
+      if (authed && socket && socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: "info", info: fileInfo }));
+        showConnected();
       }
       return;
     }

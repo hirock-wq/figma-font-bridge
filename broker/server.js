@@ -1,5 +1,6 @@
 // ローカルフォントブリッジ・ブローカー
 // 役割: Claude(curl) から届く HTTP リクエストを、Figma 開発者プラグインへ WebSocket で中継する。
+//   複数の Figma ファイルでプラグインを開いていれば全部と同時につながり、/rpc の "target" で送り先を選ぶ。
 //   Claude --HTTP:3056--> このブローカー --WS:3055--> プラグインUI --> code.js(Plugin API・ローカルフォント可)
 // すべて 127.0.0.1 のみで待ち受ける（外部からは接続できない）。
 const http = require("http");
@@ -63,25 +64,65 @@ function log(...args) {
 }
 
 // --- 状態 ---
-let pluginSocket = null;       // 接続中のプラグイン（1つだけ）
-let pluginInfo = null;         // プラグインが名乗った情報
-const pending = new Map();     // リクエストID -> {resolve, timer}
+// Figma はファイル（タブ）ごとにプラグインが別々に動くので、接続は「ファイルの数だけ」同時に持つ。
+const clients = new Map();     // 接続ID -> {id, sock, info, connectedAt}（接続中のプラグインすべて）
+const pending = new Map();     // リクエストID -> {resolve, timer, clientId}
 let seq = 0;
+let clientSeq = 0;
 
-function sendToPlugin(method, params, waitMs) {
-  return new Promise((resolve) => {
-    if (!pluginSocket) {
-      resolve({ ok: false, error: "plugin_not_connected", hint: "Figmaでプラグインを起動しトークンを貼ってください" });
-      return;
+// /status やエラー応答に載せる「接続中プラグインの一覧」（ソケットなど内部の値は出さない）
+function listClients() {
+  return Array.from(clients.values()).map((c) => {
+    const info = c.info || {};
+    return {
+      id: c.id,
+      file_name: info.file_name || null,
+      page_name: info.page_name || null,
+      file_key: info.file_key || null,
+      connected_at: c.connectedAt
+    };
+  });
+}
+
+// どのプラグイン（＝どの Figma ファイル）に送るかを決める。
+//   target あり: 接続ID → ファイルキー → ファイル名 の順に完全一致で探す
+//   target なし: 接続が1つならそれ。2つ以上なら送らずにエラー（別ファイルを誤って編集しないため）
+// 戻り値: { client } か { error: <そのまま返すエラーオブジェクト> }
+function pickClient(target) {
+  if (clients.size === 0) {
+    return { error: { ok: false, error: "plugin_not_connected", hint: "Figmaでプラグインを起動しトークンを貼ってください" } };
+  }
+  const all = Array.from(clients.values());
+  if (target === undefined || target === null || target === "") {
+    if (all.length === 1) return { client: all[0] };
+    return { error: { ok: false, error: "target_required", hint: "複数のFigmaファイルが接続中です。\"target\" にファイル名・ファイルキー・接続IDのどれかを指定してください", plugins: listClients() } };
+  }
+  const t = String(target);
+  const byId = clients.get(t);
+  if (byId) return { client: byId };
+  for (const field of ["file_key", "file_name"]) {
+    const hits = all.filter((c) => c.info && c.info[field] === t);
+    if (hits.length === 1) return { client: hits[0] };
+    if (hits.length > 1) {
+      return { error: { ok: false, error: "target_ambiguous", hint: "同じ名前のファイルが複数接続中です。接続ID（id）で指定してください", target: t, plugins: listClients() } };
     }
+  }
+  return { error: { ok: false, error: "target_not_found", hint: "そのファイルではプラグインが開かれていません", target: t, plugins: listClients() } };
+}
+
+function sendToPlugin(method, params, waitMs, target) {
+  return new Promise((resolve) => {
+    const picked = pickClient(target);
+    if (picked.error) { resolve(picked.error); return; }
+    const client = picked.client;
     const id = "r" + (++seq);
     const timer = setTimeout(() => {
       pending.delete(id);
       resolve({ ok: false, error: "timeout", method });
     }, waitMs || TIMEOUT_MS);
-    pending.set(id, { resolve, timer });
+    pending.set(id, { resolve, timer, clientId: client.id });
     try {
-      ws.send(pluginSocket, JSON.stringify({ type: "rpc", id, method, params: params || {} }));
+      ws.send(client.sock, JSON.stringify({ type: "rpc", id, method, params: params || {} }));
     } catch (e) {
       clearTimeout(timer); pending.delete(id);
       resolve({ ok: false, error: "send_failed", detail: String(e) });
@@ -96,6 +137,7 @@ const wsServer = http.createServer((req, res) => {
 
 wsServer.on("upgrade", (req, socket) => {
   let authed = false;
+  let client = null;   // 認証が通ったあとの、この接続の登録情報
   const sock = ws.accept(req, socket, (text) => {
     let msg;
     try { msg = JSON.parse(text); } catch { return; }
@@ -104,15 +146,22 @@ wsServer.on("upgrade", (req, socket) => {
     if (!authed) {
       if (msg.type === "auth" && msg.token === TOKEN) {
         authed = true;
-        pluginSocket = sock;
-        pluginInfo = msg.info || null;
-        ws.send(sock, JSON.stringify({ type: "auth_ok" }));
-        log("plugin connected", JSON.stringify(pluginInfo));
+        client = { id: "c" + (++clientSeq), sock, info: msg.info || null, connectedAt: new Date().toISOString() };
+        clients.set(client.id, client);
+        ws.send(sock, JSON.stringify({ type: "auth_ok", id: client.id }));
+        log("plugin connected", client.id, JSON.stringify(client.info), "(total " + clients.size + ")");
       } else {
         ws.send(sock, JSON.stringify({ type: "auth_failed" }));
         log("auth failed");
         socket.end();
       }
+      return;
+    }
+
+    // ファイル名・ページ名が変わったときの更新通知
+    if (msg.type === "info") {
+      client.info = msg.info || null;
+      log("plugin info", client.id, JSON.stringify(client.info));
       return;
     }
 
@@ -123,7 +172,15 @@ wsServer.on("upgrade", (req, socket) => {
       p.resolve(msg.result);
     }
   }, () => {
-    if (pluginSocket === sock) { pluginSocket = null; pluginInfo = null; log("plugin disconnected"); }
+    if (!client || !clients.has(client.id)) return;
+    clients.delete(client.id);
+    log("plugin disconnected", client.id, "(total " + clients.size + ")");
+    // この接続へ送って返事待ちだったリクエストは、タイムアウトを待たずにすぐ失敗で返す
+    for (const [id, p] of pending) {
+      if (p.clientId !== client.id) continue;
+      clearTimeout(p.timer); pending.delete(id);
+      p.resolve({ ok: false, error: "plugin_disconnected", hint: "実行中にプラグインとの接続が切れました" });
+    }
   });
 });
 
@@ -155,7 +212,10 @@ const httpServer = http.createServer((req, res) => {
   if (given !== TOKEN) { reply(401, { ok: false, error: "bad_token" }); return; }
 
   if (req.method === "GET" && req.url.startsWith("/status")) {
-    reply(200, { ok: true, plugin_connected: !!pluginSocket, plugin: pluginInfo, pending: pending.size, allow_script: ALLOW_SCRIPT });
+    // plugin は従来との互換用（最後に接続したプラグインの情報）。複数接続の全体は plugins を見る
+    const list = listClients();
+    const last = Array.from(clients.values()).pop();
+    reply(200, { ok: true, plugin_connected: list.length > 0, plugin: last ? last.info : null, plugins: list, pending: pending.size, allow_script: ALLOW_SCRIPT });
     return;
   }
 
@@ -174,8 +234,8 @@ const httpServer = http.createServer((req, res) => {
       // script.run はスクリプトモードを許可して起動したときだけ通す
       const blocked = gateRpc(parsed.method, ALLOW_SCRIPT);
       if (blocked) { log("rpc x ", parsed.method, "rejected:", blocked.body.error); reply(blocked.status, blocked.body); return; }
-      log("rpc ->", parsed.method, JSON.stringify(parsed.params || {}).slice(0, 300));
-      const result = await sendToPlugin(parsed.method, parsed.params, rpcWaitMs(parsed.method, parsed.params, TIMEOUT_MS));
+      log("rpc ->", parsed.method, parsed.target ? "[target=" + parsed.target + "]" : "", JSON.stringify(parsed.params || {}).slice(0, 300));
+      const result = await sendToPlugin(parsed.method, parsed.params, rpcWaitMs(parsed.method, parsed.params, TIMEOUT_MS), parsed.target);
       log("rpc <-", parsed.method, JSON.stringify(result).slice(0, 300));
       reply(200, result);
     });

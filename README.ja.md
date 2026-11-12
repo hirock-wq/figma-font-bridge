@@ -142,6 +142,28 @@ curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
   http://127.0.0.1:3056/rpc
 ```
 
+### 複数の Figma ファイルを同時に使う
+
+Figma はファイル（タブ）ごとにプラグインが別々に動く。**使いたいファイルそれぞれでプラグインを開けば、全部が同時につながる**（プラグインの状態表示に「接続済み: ファイル名」と出る）。
+
+- `/status` の `plugins` に、接続中のファイルが一覧で入る（`id`・`file_name`・`page_name`・`file_key`）
+- `/rpc` のボディに `"target"` を足して送り先を選ぶ。指定できるのは **ファイル名／ファイルキー／接続ID**（どれも完全一致）
+- 接続が1つだけのときは `target` 不要（従来どおり）
+- 接続が2つ以上で `target` が無いと、**どこにも送らず** `target_required` を返す（別ファイルの誤編集を防ぐため）
+
+```bash
+# 「My File」というファイルに送る
+curl -s -H "X-Bridge-Token: $T" -H 'content-type: application/json' \
+  -d '{"method":"selection.get","target":"My File"}' http://127.0.0.1:3056/rpc
+```
+
+| エラー | 意味 |
+|---|---|
+| `target_required` | 複数接続中なのに `target` が無い（応答の `plugins` に候補一覧） |
+| `target_not_found` | そのファイルではプラグインが開かれていない |
+| `target_ambiguous` | 同じ名前のファイルが複数ある → 接続ID（`id`）で指定する |
+| `plugin_disconnected` | 実行中にそのプラグインとの接続が切れた |
+
 ### メソッド一覧
 
 | method | params | 返り値 |

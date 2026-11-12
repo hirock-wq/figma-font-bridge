@@ -10,6 +10,10 @@ const net = require("net");
 const WS_PORT = Number(process.env.BRIDGE_WS_PORT) || 3055;
 const STATE_DIR = process.env.BRIDGE_STATE_DIR || __dirname;
 const TOKEN = fs.readFileSync(path.join(STATE_DIR, ".token"), "utf8").trim();
+// MOCK_FILE_NAME / MOCK_FILE_KEY を指定すると「そのファイルで開いたプラグイン」を名乗る（複数接続のテスト用）
+const MOCK_INFO = { plugin: "mock", file_name: process.env.MOCK_FILE_NAME || null, page_name: "Page 1", file_key: process.env.MOCK_FILE_KEY || null };
+// ファイル名を名乗っているときだけ、返事に「どのファイルが答えたか」を足す
+const WHO = MOCK_INFO.file_name ? { file_name: MOCK_INFO.file_name } : {};
 const key = crypto.randomBytes(16).toString("base64");
 
 // server.js の WS は "localhost" で待ち受ける（macOS では ::1 になることがある）ので、
@@ -47,7 +51,7 @@ socket.on("data", (chunk) => {
     console.log("[mock] handshake:", buf.slice(0, buf.indexOf("\r\n")).toString());
     buf = buf.slice(idx + 4);
     handshakeDone = true;
-    send({ type: "auth", token: TOKEN, info: { plugin: "mock" } });
+    send({ type: "auth", token: TOKEN, info: MOCK_INFO });
   }
   // サーバ→クライアントはマスク無し
   for (;;) {
@@ -62,10 +66,10 @@ socket.on("data", (chunk) => {
     console.log("[mock] recv:", text.slice(0, 200));
     if (msg.type === "rpc" && msg.method === "script.run") {
       // script.run はコードを実行せず、届いた code / args / timeoutMs をそのまま返す（配線確認用）
-      send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: { mock: true, script: true, echo: msg.params } } });
+      send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: Object.assign({ mock: true, script: true, echo: msg.params }, WHO) } });
     } else if (msg.type === "rpc") {
       // 本物の code.js の代わりにダミーの結果を返す
-      send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: { mock: true, params: msg.params } } });
+      send({ type: "rpc_result", id: msg.id, result: { ok: true, method: msg.method, data: Object.assign({ mock: true, params: msg.params }, WHO) } });
     }
   }
 });

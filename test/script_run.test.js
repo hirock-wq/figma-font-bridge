@@ -204,6 +204,95 @@ async function brokerTests() {
   });
 }
 
+// ---------- B2. 複数の Figma ファイル（プラグイン）を同時につなぐ ----------
+
+// 起動済みのテスト用ブローカーに、モックプラグインをもう1つつなぐ（fileName のファイルで開いた体）
+async function addMock(b, fileName, fileKey) {
+  const env = Object.assign({}, process.env, {
+    BRIDGE_WS_PORT: String(b.wsPort), BRIDGE_STATE_DIR: b.stateDir,
+    MOCK_FILE_NAME: fileName, MOCK_FILE_KEY: fileKey || ""
+  });
+  const before = (await request(b.httpPort, b.token, "GET", "/status")).json.plugins.length;
+  const mock = spawn(process.execPath, [path.join(ROOT, "broker/mock-plugin.js")], { env, stdio: "ignore" });
+  children.push(mock);
+  for (let i = 0; i < 100; i++) {
+    const s = await request(b.httpPort, b.token, "GET", "/status");
+    if (s.json.plugins.length > before) break;
+    await sleep(50);
+  }
+  return mock;
+}
+
+async function multiClientTests() {
+  const b = await startBroker("multi");   // 最初のモックはファイル名なし（旧プラグイン相当）
+  const rpc = (body) => request(b.httpPort, b.token, "POST", "/rpc", body);
+
+  await test("multi: one plugin connected -> rpc without target works as before", async () => {
+    const r = await rpc({ method: "ping" });
+    assert.strictEqual(r.json.ok, true);
+  });
+
+  const mockA = await addMock(b, "FileA", "keyA");
+  await addMock(b, "FileB", "keyB");
+
+  await test("multi: /status lists every connected plugin", async () => {
+    const s = (await request(b.httpPort, b.token, "GET", "/status")).json;
+    assert.strictEqual(s.plugin_connected, true);
+    assert.strictEqual(s.plugins.length, 3);
+    assert.deepStrictEqual(s.plugins.map((p) => p.file_name).sort(), ["FileA", "FileB", null].sort());
+    assert.ok(s.plugins.every((p) => /^c\d+$/.test(p.id)));
+  });
+
+  await test("multi: rpc without target is refused (target_required) and not forwarded", async () => {
+    const r = await rpc({ method: "ping" });
+    assert.strictEqual(r.json.ok, false);
+    assert.strictEqual(r.json.error, "target_required");
+    assert.strictEqual(r.json.plugins.length, 3);
+  });
+
+  await test("multi: target by file name / file key / connection id reaches the right plugin", async () => {
+    const a = await rpc({ method: "ping", target: "FileA" });
+    assert.strictEqual(a.json.data.file_name, "FileA");
+    const bb = await rpc({ method: "ping", target: "FileB" });
+    assert.strictEqual(bb.json.data.file_name, "FileB");
+    const k = await rpc({ method: "ping", target: "keyB" });
+    assert.strictEqual(k.json.data.file_name, "FileB");
+    const s = (await request(b.httpPort, b.token, "GET", "/status")).json;
+    const idA = s.plugins.find((p) => p.file_name === "FileA").id;
+    const i = await rpc({ method: "ping", target: idA });
+    assert.strictEqual(i.json.data.file_name, "FileA");
+  });
+
+  await test("multi: unknown target -> target_not_found with the list", async () => {
+    const r = await rpc({ method: "ping", target: "Nope" });
+    assert.strictEqual(r.json.error, "target_not_found");
+    assert.strictEqual(r.json.plugins.length, 3);
+  });
+
+  await test("multi: same file name twice -> target_ambiguous; id still works", async () => {
+    await addMock(b, "FileB", "keyB2");
+    const r = await rpc({ method: "ping", target: "FileB" });
+    assert.strictEqual(r.json.error, "target_ambiguous");
+    const k = await rpc({ method: "ping", target: "keyB2" });
+    assert.strictEqual(k.json.ok, true);
+  });
+
+  await test("multi: a plugin disconnecting is removed from the list; others keep working", async () => {
+    mockA.kill("SIGTERM");
+    let s;
+    for (let i = 0; i < 100; i++) {
+      s = (await request(b.httpPort, b.token, "GET", "/status")).json;
+      if (!s.plugins.some((p) => p.file_name === "FileA")) break;
+      await sleep(50);
+    }
+    assert.ok(!s.plugins.some((p) => p.file_name === "FileA"), JSON.stringify(s.plugins) + "\n" + b.logs());
+    const gone = await rpc({ method: "ping", target: "FileA" });
+    assert.strictEqual(gone.json.error, "target_not_found");
+    const still = await rpc({ method: "ping", target: "keyB" });
+    assert.strictEqual(still.json.data.file_name, "FileB");
+  });
+}
+
 // ---------- C. plugin/code.js を vm で実行 ----------
 
 // code.js を読み込んだ仮想プラグイン環境を作る
@@ -367,6 +456,21 @@ async function pluginTests() {
     assert.strictEqual(ok.ok, true);
   });
 
+  await test("plugin: settings_load / info_request post this file's name and page", async () => {
+    P.posted.length = 0;
+    P.figma.ui.onmessage({ type: "info_request" });
+    const m = P.posted.find((x) => x.type === "info");
+    assert.ok(m, "info message posted");
+    assert.strictEqual(m.info.file_name, "TestFile");
+    assert.strictEqual(m.info.page_name, "Page 1");
+    assert.strictEqual(m.info.file_key, null);
+    P.posted.length = 0;
+    P.figma.ui.onmessage({ type: "settings_load" });
+    await sleep(20);
+    const types = P.posted.map((x) => x.type);
+    assert.ok(types.indexOf("info") >= 0 && types.indexOf("info") < types.indexOf("settings"), "info before settings: " + types);
+  });
+
   await test("plugin: missing code -> handler_error", async () => {
     const r = await P.rpc("script.run", {});
     assert.strictEqual(r.ok, false);
@@ -397,6 +501,7 @@ async function pluginTests() {
   try {
     await gateTests();
     await brokerTests();
+    await multiClientTests();
     await pluginTests();
   } catch (e) {
     results.push({ name: "setup", ok: false });

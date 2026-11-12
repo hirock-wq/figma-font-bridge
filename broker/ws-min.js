@@ -62,6 +62,9 @@ function accept(req, socket, onMessage, onClose) {
       }
     }
   });
+  // 相手（プラグイン）が終了フレームなしで落ちた場合。http 由来のソケットは「半分だけ開いた」状態で
+  // 残るので、こちらからも閉じて切断として扱う（これが無いと落ちたプラグインが接続中のまま残る）
+  socket.on("end", () => { socket.destroy(); if (onClose) onClose(); });
   socket.on("error", () => { if (onClose) onClose(); });
   socket.on("close", () => { if (onClose) onClose(); });
   return socket;
